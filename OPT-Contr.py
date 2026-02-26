@@ -56,7 +56,7 @@ steps = int(T / dt)
 t = np.linspace(0, T, steps)
 
 # 初始条件（回归原参数）
-S0, H0, I0, R0, F0 = 850.0, 100.0, 5.0, 0.0, 0.0
+S0, H0, I0, R0, F0 = 850.0, 100.0, 50.0, 0.0, 0.0
 
 # -----------------------------
 # 3. 控制器（回归固定权重双分支，修复梯度）
@@ -478,4 +478,5 @@ print(f"\nAll stable high-performance data saved to {FIG_DIR}/shirf_stable_high_
 print(f"\nScience-Quality Figures Generated in: {FIG_DIR}")
 print("1. Fig1_Dynamics_Science.png  (Main results)")
 print("2. Fig2_PhasePlane_Science.png (System stability)")
+
 print("3. Fig3_Metrics_Scorecard.png (Quantitative metrics)")
