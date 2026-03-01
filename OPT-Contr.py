@@ -87,7 +87,7 @@ class StablePeakPolicy(nn.Module):
         peak_out = self.peak_branch(x)
         normal_out = self.normal_branch(x)
         # 回归固定权重（7:3），避免动态权重的梯度震荡
-        return 2*self.fusion(0.7 * peak_out + 0.3 * normal_out)
+        return self.fusion(0.7 * peak_out + 0.3 * normal_out)
 
 # 优化器配置
 policy = StablePeakPolicy().to(device)
@@ -480,3 +480,4 @@ print("1. Fig1_Dynamics_Science.png  (Main results)")
 print("2. Fig2_PhasePlane_Science.png (System stability)")
 
 print("3. Fig3_Metrics_Scorecard.png (Quantitative metrics)")
+
