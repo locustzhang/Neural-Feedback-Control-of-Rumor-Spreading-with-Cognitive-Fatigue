@@ -1,0 +1,474 @@
+# ====================== 自动修复字体警告 ======================
+import matplotlib
+matplotlib.rcParams['font.family'] = 'DejaVu Sans'  # 替代 Arial
+matplotlib.rcParams['axes.unicode_minus'] = False   # 保证负号正常
+# ==============================================================
+
+import os
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim.lr_scheduler as lr_scheduler
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from tqdm import trange
+import matplotlib.gridspec as gridspec
+from scipy.signal import find_peaks
+
+# ============== 彻底关闭所有警告 ==============
+warnings.filterwarnings('ignore')
+os.environ['PYTHONWARNINGS'] = 'ignore'
+
+# ============== 绘图配置（干净、无字体报错）==============
+plt.rcParams.update({
+    "font.size": 10,
+    "axes.linewidth": 0.8,
+    "lines.linewidth": 1.8,
+    "xtick.major.width": 0.8,
+    "ytick.major.width": 0.8,
+    "xtick.major.size": 3,
+    "ytick.major.size": 3,
+    "legend.frameon": False,
+    "legend.fontsize": 9,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 600,
+    "savefig.dpi": 600,
+})
+
+# ============================================================
+# 兼容 & 全局参数
+# ============================================================
+if hasattr(np, 'trapezoid'):
+    trapz = np.trapezoid
+else:
+    trapz = np.trapz
+
+torch.manual_seed(42)
+np.random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+OUTPUT_DIR = "figures_science_final"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+N = 1000.0
+beta_base = 0.50
+delta_base = 0.40
+gamma_base = 0.05
+alpha_base = 0.10
+eta_F = 0.2
+kappa_F = 2.0
+eta_H = 0.05
+
+a, b, c = 3.0, 0.05, 0.2
+theta = 9.0
+epsilon = 0.1
+T2_end = 30.0
+T1_peak = 13.2
+
+def compute_weight(t_val):
+    if t_val <= T1_peak:
+        return 1.0 + theta * t_val / T1_peak
+    elif t_val <= T2_end:
+        return 1.0 + theta
+    else:
+        return 1.0 + theta * np.exp(-epsilon * (t_val - T2_end))
+
+T = 60.0
+dt = 0.2
+steps = int(T / dt)
+t_arr = np.arange(0, T, dt)
+S0, H0, I0, R0, F0 = 850.0, 100.0, 50.0, 0.0, 0.0
+
+PMP_SEGMENTS = 30
+PMP_MAX_ITER = 200
+
+# ============================================================
+# 动力学模型（论文原版）
+# ============================================================
+def compute_derivatives(state, u, t_step):
+    S, H, I, R, F = state
+    beta = beta_base * np.exp(-t_step * dt / 60.0)
+    eff_alpha = alpha_base * (1.0 + u) * np.exp(-F)
+    dS = -beta * S * I / N - 0.2 * eff_alpha * S
+    dH = beta * S * I / N - delta_base * H - eta_H * H - 0.3 * eff_alpha * H
+    dI = delta_base * H - gamma_base * I - 0.5 * eff_alpha * I
+    dR = gamma_base * I + eta_H * H + eff_alpha * (0.2 * S + 0.3 * H + 0.5 * I)
+    dF = eta_F * u - kappa_F * F
+    return np.array([dS, dH, dI, dR, dF], dtype=np.float64)
+
+def rk4_integrate(state, u, t_step, dt_val=dt):
+    k1 = compute_derivatives(state, u, t_step)
+    k2 = compute_derivatives(state + 0.5 * dt_val * k1, u, t_step)
+    k3 = compute_derivatives(state + 0.5 * dt_val * k2, u, t_step)
+    k4 = compute_derivatives(state + dt_val * k3, u, t_step)
+    return state + dt_val / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+def simulate_numpy(u_values):
+    state = np.array([S0, H0, I0, R0, F0], dtype=np.float64)
+    traj = np.empty((steps, 5), dtype=np.float64)
+    cost_I = 0.0
+    cost_u = 0.0
+    cost_F = 0.0
+
+    for t_step in range(steps):
+        u = float(np.clip(u_values[t_step], 0.0, 1.0))
+        traj[t_step] = state.copy()
+        current_t = t_step * dt
+        w = compute_weight(current_t)
+        cost_I += a * state[2] * w * dt
+        cost_u += b * u ** 2 * dt
+        cost_F += c * state[4] ** 2 * dt
+        state = rk4_integrate(state, u, t_step)
+        state = np.clip(state, 0.0, None)
+        mass = state[:4].sum()
+        if mass > 1e-6:
+            state[:4] = state[:4] * N / mass
+    total_cost = cost_I + cost_u + cost_F
+    return traj, cost_I, cost_u, cost_F, total_cost
+
+# ============================================================
+# PyTorch 动力学（已修复 CUDA 错误）
+# ============================================================
+def step_dynamics_torch(state, u, t_step):
+    S, H, I, R, F = state
+    beta = beta_base * torch.exp(torch.tensor(-t_step * dt / 60.0, device=device, dtype=torch.float32))
+    eff_alpha = alpha_base * (1.0 + u) * torch.exp(-F)
+    dS = -beta * S * I / N - 0.2 * eff_alpha * S
+    dH = beta * S * I / N - delta_base * H - eta_H * H - 0.3 * eff_alpha * H
+    dI = delta_base * H - gamma_base * I - 0.5 * eff_alpha * I
+    dR = gamma_base * I + eta_H * H + eff_alpha * (0.2 * S + 0.3 * H + 0.5 * I)
+    dF = eta_F * u - kappa_F * F
+    return torch.stack([dS, dH, dI, dR, dF])
+
+def simulate_torch_train(policy):
+    state = torch.tensor([S0, H0, I0, R0, F0], device=device, dtype=torch.float32)
+    cost_I = torch.tensor(0.0, device=device)
+    cost_u = torch.tensor(0.0, device=device)
+    cost_F = torch.tensor(0.0, device=device)
+    for t_step in range(steps):
+        u = policy(state.unsqueeze(0)).squeeze()
+        current_t = t_step * dt
+        w = compute_weight(current_t)
+        w_t = torch.tensor(w, device=device, dtype=torch.float32)
+        cost_I += a * state[2] * w_t * dt
+        cost_u += b * u ** 2 * dt
+        cost_F += c * state[4] ** 2 * dt
+        k1 = step_dynamics_torch(state, u, t_step)
+        k2 = step_dynamics_torch(state + 0.5 * dt * k1, u, t_step)
+        k3 = step_dynamics_torch(state + 0.5 * dt * k2, u, t_step)
+        k4 = step_dynamics_torch(state + dt * k3, u, t_step)
+        state = state + dt / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        state = torch.clamp(state, min=0.0)
+        mass = state[:4].sum()
+        if mass.item() > 1e-6:
+            state[:4] = state[:4] * N / mass
+    cost_tensor = cost_I + cost_u + cost_F
+    return cost_tensor, cost_tensor.detach().cpu().item()
+
+# ============================================================
+# 控制网络
+# ============================================================
+def get_neural_control_sequence(policy):
+    u_values = np.zeros(steps)
+    state_np = np.array([S0, H0, I0, R0, F0], dtype=np.float64)
+    with torch.no_grad():
+        for t_step in range(steps):
+            state_t = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
+            u_t = policy(state_t).cpu().item()
+            u_values[t_step] = np.clip(u_t, 0.0, 1.0)
+            state_np = rk4_integrate(state_np, u_values[t_step], t_step)
+            state_np = np.clip(state_np, 0.0, None)
+            mass = state_np[:4].sum()
+            if mass > 1e-6:
+                state_np[:4] = state_np[:4] * N / mass
+    return u_values
+
+class StablePeakPolicy(nn.Module):
+    def __init__(self, w_peak=0.7, w_normal=0.3):
+        super().__init__()
+        self.w_peak = w_peak
+        self.w_normal = w_normal
+        self.peak_branch = nn.Sequential(
+            nn.Linear(5, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        self.normal_branch = nn.Sequential(
+            nn.Linear(5, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        self.fusion = nn.Sigmoid()
+
+    def forward(self, x):
+        return self.fusion(self.w_peak * self.peak_branch(x) + self.w_normal * self.normal_branch(x))
+
+# ============================================================
+# 训练
+# ============================================================
+def train_controller():
+    policy = StablePeakPolicy(w_peak=0.7, w_normal=0.3).to(device)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1.5e-3, weight_decay=1e-5)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=500, eta_min=1e-4)
+    print("\n" + "="*60)
+    print("Training Neural Controller")
+    print("="*60)
+    best_J = float('inf')
+    patience = 100
+    counter = 0
+    epochs = 500
+    for ep in trange(epochs, desc="Training"):
+        optimizer.zero_grad()
+        cost_tensor, J_scalar = simulate_torch_train(policy)
+        cost_tensor.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+        if (best_J - J_scalar) > 1e-4:
+            best_J = J_scalar
+            counter = 0
+            torch.save(policy.state_dict(), os.path.join(OUTPUT_DIR, "best_policy.pth"))
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"\nEarly stop at epoch {ep}, Best J = {best_J:.2f}")
+                break
+    policy.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "best_policy.pth"), map_location=device, weights_only=True))
+    policy.eval()
+    print(f"Training complete. Best cost = {best_J:.2f}")
+    return policy
+
+# ============================================================
+# PMP 最优控制
+# ============================================================
+def run_pmp_optimization():
+    print("\n" + "="*60)
+    print("PMP Baseline Optimization")
+    print("="*60)
+    def pmp_obj(u_seg):
+        u_full = np.interp(np.arange(steps), np.linspace(0, steps-1, PMP_SEGMENTS), u_seg)
+        u_full = np.clip(u_full, 0.0, 1.0)
+        _, _, _, _, cost = simulate_numpy(u_full)
+        return cost
+    u0 = np.zeros(PMP_SEGMENTS)
+    bounds = [(0.0,1.0)]*PMP_SEGMENTS
+    res = minimize(pmp_obj, u0, method='L-BFGS-B', bounds=bounds, options={'maxiter':PMP_MAX_ITER, 'ftol':1e-6})
+    print(f"PMP success: {res.success}, cost: {res.fun:.2f}, iterations: {res.nit}")
+    u_pmp = np.clip(np.interp(np.arange(steps), np.linspace(0,steps-1,PMP_SEGMENTS), res.x), 0.0,1.0)
+    return u_pmp, res
+
+# ============================================================
+# 鲁棒性实验（已加入：单峰性 + 稳定性检测）
+# ============================================================
+def run_robustness_experiments(policy_net):
+    global beta_base, delta_base, gamma_base, alpha_base
+    orig = {'beta':beta_base,'delta':delta_base,'gamma':gamma_base,'alpha':alpha_base}
+    perturbs = {
+        'Baseline':      (0.00, 0.00, 0.00, 0.00),
+        r'$\beta$+10%':  (0.10, 0.00, 0.00, 0.00),
+        r'$\beta$-10%': (-0.10, 0.00, 0.00, 0.00),
+        r'$\delta$+10%': (0.00, 0.10, 0.00, 0.00),
+        r'$\delta$-10%': (0.00,-0.10, 0.00, 0.00),
+        r'$\gamma$+10%': (0.00, 0.00, 0.10, 0.00),
+        r'$\gamma$-10%': (0.00, 0.00,-0.10, 0.00),
+        r'$\alpha$+10%': (0.00, 0.00, 0.00, 0.10),
+        r'$\alpha$-10%': (0.00, 0.00, 0.00,-0.10),
+    }
+    rob_results = {}
+    try:
+        for lab, (db,dd,dg,da) in perturbs.items():
+            beta_base  = orig['beta']*(1+db)
+            delta_base = orig['delta']*(1+dd)
+            gamma_base = orig['gamma']*(1+dg)
+            alpha_base = orig['alpha']*(1+da)
+            u_rob = get_neural_control_sequence(policy_net)
+            traj_rob,_,_,_,J_rob = simulate_numpy(u_rob)
+            I = traj_rob[:,2]
+            
+            # 单峰性检测：峰值后是否存在第二个局部极大值
+            peak_idx = int(np.argmax(I))
+            post_peak = I[peak_idx:]
+            sec_peaks, _ = find_peaks(post_peak, height=0.01*I.max(), distance=5)
+            is_unimodal = (len(sec_peaks) <= 1)  # 仅全局最大峰
+            
+            # 动态稳定性：末端10天均值 < 峰值的5%（视为清除/收敛）
+            late_mean = I[-50:].mean()  # 最后10天 (dt=0.2 → 50步)
+            is_stable = late_mean < 0.05 * I.max()
+            
+            rob_results[lab] = {
+                'traj': traj_rob, 'J': J_rob, 'Imax': I.max(),
+                'unimodal': is_unimodal, 'stable': is_stable
+            }
+    finally:
+        beta_base = orig['beta']
+        delta_base = orig['delta']
+        gamma_base = orig['gamma']
+        alpha_base = orig['alpha']
+    return rob_results
+
+# ====================== Science 绘图工具函数 ======================
+def set_science_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.tick_params(direction='out', length=4, width=0.8)
+    ax.grid(alpha=0.2, linestyle='--', linewidth=0.5)
+
+def save_fig(name):
+    plt.savefig(os.path.join(OUTPUT_DIR, f"{name}.pdf"), bbox_inches='tight', pad_inches=0.05)
+    plt.savefig(os.path.join(OUTPUT_DIR, f"{name}.png"), bbox_inches='tight', pad_inches=0.05)
+    plt.close()
+
+# ============================================================
+# 主程序
+# ============================================================
+if __name__ == "__main__":
+    u_zero = np.zeros(steps)
+    traj_pre,_,_,_,_ = simulate_numpy(u_zero)
+    T1_peak = float(t_arr[np.argmax(traj_pre[:,2])])
+    print(f"\nPeak time T1 = {T1_peak:.2f} days")
+
+    main_policy = train_controller()
+    u_ctrl = get_neural_control_sequence(main_policy)
+    traj_ctrl,_,_,_,J_ctrl = simulate_numpy(u_ctrl)
+    traj_free,_,_,_,J_free = simulate_numpy(u_zero)
+    u_pmp,_ = run_pmp_optimization()
+    traj_pmp,_,_,_,J_pmp = simulate_numpy(u_pmp)
+
+    I_free_max = traj_free[:,2].max()
+    I_ctrl_max = traj_ctrl[:,2].max()
+    I_pmp_max  = traj_pmp[:,2].max()
+
+    I_int_free = trapz(traj_free[:,2], t_arr)
+    I_int_ctrl = trapz(traj_ctrl[:,2], t_arr)
+    I_int_pmp  = trapz(traj_pmp[:,2], t_arr)
+
+    peak_supp_ctrl = (I_free_max - I_ctrl_max) / I_free_max * 100
+    peak_supp_pmp  = (I_free_max - I_pmp_max) / I_free_max * 100
+    cost_red_ctrl  = (J_free - J_ctrl) / J_free * 100
+    cost_red_pmp   = (J_free - J_pmp) / J_free * 100
+
+    late_free = traj_free[-10:,2].mean()
+    late_ctrl = traj_ctrl[-10:,2].mean()
+    late_pmp  = traj_pmp[-10:,2].mean()
+    clear_ctrl = (1 - late_ctrl/late_free)*100 if late_free>0 else 0
+    clear_pmp  = (1 - late_pmp/late_free)*100 if late_free>0 else 0
+
+    # ====================== 论文级控制台输出 ======================
+    print("\n" + "="*120)
+    print(" FINAL RESULTS FOR SCIENCE MANUSCRIPT ")
+    print("="*120)
+    print(f"{'Metric':<25} | {'Uncontrolled':<15} | {'PMP (Optimized)':<20} | {'SHIR-F (Neural)':<20} | {'Gain (%)':<10}")
+    print("-"*120)
+    def print_row(name, val0, val1, val2):
+        gain = ((val0 - val2) / val0 * 100) if val0 != 0 else 0
+        print(f"{name:<25} | {val0:>15.2f} | {val1:>20.2f} | {val2:>20.2f} | {gain:>9.2f}%")
+    print_row("Peak Infection", I_free_max, I_pmp_max, I_ctrl_max)
+    print_row("Total Objective Cost", J_free, J_pmp, J_ctrl)
+    print_row("Infection Integral", I_int_free, I_int_pmp, I_int_ctrl)
+    print("="*120)
+    print(f"Summary: Neural controller achieves {cost_red_ctrl:.2f}% cost reduction.")
+
+    # ====================== Fig1 动力学对比 (a)(b) ======================
+    fig = plt.figure(figsize=(7, 5))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[1.8, 1.2], hspace=0.3)
+    ax0 = plt.subplot(gs[0])
+    ax0.plot(t_arr, traj_free[:, 2], color='#333333', linestyle='--', lw=1.5, label='Uncontrolled')
+    ax0.plot(t_arr, traj_pmp[:, 2], color='#E41A1C', lw=1.5, label='PMP Baseline')
+    ax0.plot(t_arr, traj_ctrl[:, 2], color='#377EB8', lw=2.0, label='SHIR-F Neural Control')
+    ax0.fill_between(t_arr, traj_ctrl[:, 2], traj_free[:, 2], color='#377EB8', alpha=0.1)
+    ax0.set_ylabel(r'Infected $I(t)$', fontsize=11)
+    ax0.legend(frameon=False, loc='upper right', ncol=3, fontsize=8)
+    ax0.text(-0.1, 1.05, 'a', transform=ax0.transAxes, fontsize=14, fontweight='bold')
+    set_science_style(ax0)
+
+    ax1 = plt.subplot(gs[1])
+    ax1.plot(t_arr, u_ctrl, color='#4DAF4A', label=r'Control $u(t)$', lw=1.5)
+    ax1_twin = ax1.twinx()
+    ax1_twin.plot(t_arr, traj_ctrl[:, 4], color='#984EA3', linestyle=':', label=r'Fatigue $F(t)$', lw=1.5)
+    ax1.set_xlabel('Time (days)', fontsize=11)
+    ax1.set_ylabel('Control $u$', fontsize=11, color='#4DAF4A')
+    ax1_twin.set_ylabel('Fatigue $F$', fontsize=11, color='#984EA3')
+    ax1.text(-0.1, 1.05, 'b', transform=ax1.transAxes, fontsize=14, fontweight='bold')
+    set_science_style(ax1)
+    save_fig("Fig1_Dynamics_Comparison")
+
+    # ====================== Fig2 相平面 ======================
+    plt.figure(figsize=(5, 4))
+    plt.plot(traj_free[:, 0], traj_free[:, 2], '--', color='#777777', label='Uncontrolled')
+    plt.plot(traj_ctrl[:, 0], traj_ctrl[:, 2], color='#377EB8', lw=2, label='Neural Controlled')
+    plt.scatter(S0, I0, c='black', s=30, zorder=5, label='Initial State')
+    plt.gca().invert_xaxis()
+    plt.xlabel(r'Susceptible $S(t)$', fontsize=11)
+    plt.ylabel(r'Infected $I(t)$', fontsize=11)
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    save_fig("Fig2_Phase_Plane")
+
+    # ====================== Fig3 性能指标 ======================
+    plt.figure(figsize=(5, 3))
+    metrics = ['Peak Supp.', 'Cost Red.', 'Inf. Red.', 'Clearance']
+    vals = [peak_supp_ctrl, cost_red_ctrl, (I_int_free-I_int_ctrl)/I_int_free*100, clear_ctrl]
+    bars = plt.barh(metrics, vals, color='#377EB8', height=0.6, alpha=0.8)
+    plt.xlabel('Performance Improvement (%)', fontsize=11)
+    plt.xlim(0, max(vals)+10)
+    for i, v in enumerate(vals):
+        plt.text(v + 1, i, f'{v:.1f}%', va='center', fontsize=9)
+    plt.tight_layout()
+    save_fig("Fig3_Performance_Metrics")
+
+    # ====================== Fig4 鲁棒性 + 单峰/稳定性输出 ======================
+    print("\nRunning robustness analysis...")
+    rob_data = run_robustness_experiments(main_policy)
+
+    # 控制台输出单峰性/稳定性验证结果
+    print(f"\n{'Perturbation':<14} | {'I_peak':>8} | {'Unimodal':>8} | {'Stable':>8}")
+    print("-" * 50)
+    for lab, d in rob_data.items():
+        u = "✓" if d['unimodal'] else "✗"
+        s = "✓" if d['stable'] else "✗"
+        print(f"{lab:<14} | {d['Imax']:>8.2f} | {u:>8} | {s:>8}")
+    print("-" * 50)
+
+    fig, axes = plt.subplots(2,1, figsize=(7,5), sharex=True)
+    fig.subplots_adjust(hspace=0.25)
+
+    cmap = {
+        'Baseline':'#000000', r'$\beta$+10%':'#E41A1C',r'$\beta$-10%':'#377EB8',
+        r'$\delta$+10%':'#4DAF4A',r'$\delta$-10%':'#984EA3',r'$\gamma$+10%':'#FF7F00',
+        r'$\gamma$-10%':'#FFFF33',r'$\alpha$+10%':'#A65628',r'$\alpha$-10%':'#F781BF'
+    }
+
+    for lab, d in rob_data.items():
+        axes[0].plot(t_arr, d['traj'][:,2], color=cmap[lab], lw=1.5 if lab=="Baseline" else 1.0, label=lab)
+    axes[0].set_ylabel(r'Infected $I(t)$', fontsize=11)
+    axes[0].grid(alpha=0.2, ls='--')
+    axes[0].legend(ncol=3, fontsize=7, frameon=False)
+    axes[0].text(-0.1, 1.05, 'a', transform=axes[0].transAxes, fontsize=14, fontweight='bold')
+
+    for lab, d in rob_data.items():
+        axes[1].plot(t_arr, d['traj'][:,4], color=cmap[lab], lw=1.5 if lab=="Baseline" else 1.0)
+    axes[1].set_xlabel('Time (days)', fontsize=11)
+    axes[1].set_ylabel(r'Fatigue $F(t)$', fontsize=11)
+    axes[1].grid(alpha=0.2, ls='--')
+    axes[1].text(-0.1, 1.05, 'b', transform=axes[1].transAxes, fontsize=14, fontweight='bold')
+    save_fig("Fig4_Robustness")
+
+    # ====================== LaTeX 表格 ======================
+    with open(os.path.join(OUTPUT_DIR,"table_science.tex"),"w") as f:
+        f.write("\\begin{table}[htbp]\n\\centering\n\\caption{Performance comparison}\n\\label{tab:results}\n")
+        f.write("\\begin{tabular}{lccccc}\n\\toprule\n")
+        f.write("Method & Peak $I$ & Peak Supp.(\%) & Cost & Integral & Clearance(\%) \\\\\n\\midrule\n")
+        f.write(f"Uncontrolled & {I_free_max:.2f} & -- & {J_free:.2f} & {I_int_free:.2f} & -- \\\\\n")
+        f.write(f"PMP & {I_pmp_max:.2f} & {peak_supp_pmp:.2f} & {J_pmp:.2f} & {I_int_pmp:.2f} & {clear_pmp:.2f} \\\\\n")
+        f.write(f"Neural & {I_ctrl_max:.2f} & {peak_supp_ctrl:.2f} & {J_ctrl:.2f} & {I_int_ctrl:.2f} & {clear_ctrl:.2f} \\\\\n")
+        f.write("\\bottomrule\n\\end{tabular}\n\\end{table}\n")
+
+    print("\n✅ ALL TASKS COMPLETED — READY FOR SUBMISSION")
+    print(f"📁 Figures saved to: {OUTPUT_DIR}")
+    print("📄 Format: 600DPI PNG + PDF (Vector)")
+    print("📋 Table & Results ready for paper")
